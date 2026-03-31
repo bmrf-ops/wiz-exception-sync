@@ -1,0 +1,129 @@
+name: Sync Repositories
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  SCAFFOLD_BRANCH: sync-hub/scaffold
+  TEMPLATE_PATH: templates/.wiz
+  REPOS_DIR: repositories
+
+jobs:
+  scaffold:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sync-hub
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Discover repos accessible to the App
+        id: discover
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          repos_json=$(gh api --paginate /installation/repositories \
+            --jq '.repositories[] | select(.archived == false and .fork == false) | {name: .name, id: .id, full_name: .full_name}' \
+            | jq -s '.')
+
+          echo "repos<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$repos_json" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          count=$(echo "$repos_json" | jq length)
+          echo "Found $count active, non-fork repositories"
+
+      - name: Scaffold new repo folders
+        run: |
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          while read -r repo; do
+            name=$(echo "$repo" | jq -r '.name')
+            repo_dir="${REPOS_DIR}/${name}"
+
+            if [ -d "$repo_dir" ]; then
+              echo "Skipping $name (folder exists)"
+              continue
+            fi
+
+            echo "Scaffolding $name (id: $(echo "$repo" | jq -r '.id'))"
+            mkdir -p "$repo_dir"
+            cp "$TEMPLATE_PATH" "${repo_dir}/.wiz"
+
+            echo "$repo" | jq --arg ts "$now" \
+              '{id: .id, full_name: .full_name, scaffolded_at: $ts}' \
+              > "${repo_dir}/META.json"
+
+          done < <(echo '${{ steps.discover.outputs.repos }}' | jq -c '.[]')
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No new repositories to scaffold"
+          fi
+
+      - name: Create PR with scaffolded repos
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git config user.name "sync-hub[bot]"
+          git config user.email "sync-hub[bot]@users.noreply.github.com"
+
+          # Delete remote branch if it exists (stale from previous run)
+          git push origin --delete "$SCAFFOLD_BRANCH" 2>/dev/null || true
+
+          git checkout -b "$SCAFFOLD_BRANCH"
+          git add "$REPOS_DIR"
+          git commit -m "chore: scaffold new repository folders"
+
+          git push origin "$SCAFFOLD_BRANCH"
+
+          # Close any existing scaffold PR
+          existing_pr=$(gh pr list --head "$SCAFFOLD_BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing_pr" ]; then
+            gh pr close "$existing_pr" --comment "Superseded by new scaffold run."
+          fi
+
+          new_repos=$(git diff --name-only main..."$SCAFFOLD_BRANCH" -- "$REPOS_DIR" \
+            | grep 'META.json' \
+            | sed 's|repositories/||; s|/META.json||' \
+            | sort)
+
+          repo_list=""
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            repo_list="${repo_list}- \`${name}\`"$'\n'
+          done <<< "$new_repos"
+
+          body="## New Repositories Discovered
+
+          The following repositories were found via the GitHub App installation and do not yet have folders in \`repositories/\`:
+
+          ${repo_list}
+          Each folder contains:
+          - \`.wiz\` -- bootstrap exception file from template
+          - \`META.json\` -- repository identity metadata
+
+          Review and merge to enable exception management for these repos."
+
+          gh pr create \
+            --title "chore: scaffold new repository folders" \
+            --body "$body"

@@ -1,0 +1,220 @@
+name: Push Exceptions to Repos
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "repositories/**/.wiz"
+
+permissions:
+  contents: read
+
+env:
+  WIZ_TARGET_PATH: .wiz
+  REPOS_DIR: repositories
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.changed.outputs.matrix }}
+      has_changes: ${{ steps.changed.outputs.has_changes }}
+    steps:
+      - name: Checkout sync-hub
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed repo folders
+        id: changed
+        run: |
+          changed_dirs=$(git diff HEAD~1 --name-only -- "${REPOS_DIR}/" \
+            | grep '\.wiz$' \
+            | sed 's|^repositories/||; s|/\.wiz$||' \
+            | sort -u)
+
+          if [ -z "$changed_dirs" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"repo\":[]}" >> "$GITHUB_OUTPUT"
+            echo "No .wiz file changes detected"
+            exit 0
+          fi
+
+          repos_json="["
+          first=true
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+
+            meta_file="${REPOS_DIR}/${dir}/META.json"
+            if [ ! -f "$meta_file" ]; then
+              echo "::warning::No META.json for ${dir}, skipping"
+              continue
+            fi
+
+            repo_id=$(jq -r '.id' "$meta_file")
+            full_name=$(jq -r '.full_name' "$meta_file")
+
+            if [ "$first" = true ]; then
+              first=false
+            else
+              repos_json="${repos_json},"
+            fi
+            repos_json="${repos_json}{\"dir\":\"${dir}\",\"repo_id\":${repo_id},\"full_name\":\"${full_name}\"}"
+          done <<< "$changed_dirs"
+          repos_json="${repos_json}]"
+
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "matrix={\"repo\":${repos_json}}" >> "$GITHUB_OUTPUT"
+          echo "Changed repos: $changed_dirs"
+
+  push-wiz:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+    concurrency:
+      group: wiz-push-${{ matrix.repo.full_name }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout sync-hub
+        uses: actions/checkout@v4
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Resolve current repo name and push .wiz
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO_DIR: ${{ matrix.repo.dir }}
+          REPO_FULL_NAME: ${{ matrix.repo.full_name }}
+          REPO_ID: ${{ matrix.repo.repo_id }}
+        run: |
+          set -euo pipefail
+
+          BRANCH_NAME="sync-hub/wiz-update"
+          WIZ_SOURCE="${REPOS_DIR}/${REPO_DIR}/.wiz"
+          COMMIT_SHA="${GITHUB_SHA}"
+
+          # --- Resolve current repo name (handles renames) ---
+          current_repo=$(gh api "/repositories/${REPO_ID}" --jq '.full_name' 2>/dev/null || echo "")
+          if [ -z "$current_repo" ]; then
+            echo "::error::Repository ID ${REPO_ID} not found (deleted or App uninstalled)"
+            exit 1
+          fi
+
+          if [ "$current_repo" != "$REPO_FULL_NAME" ]; then
+            echo "::notice::Repository renamed: ${REPO_FULL_NAME} -> ${current_repo}"
+          fi
+
+          owner=$(echo "$current_repo" | cut -d'/' -f1)
+          repo=$(echo "$current_repo" | cut -d'/' -f2)
+
+          # --- Check if repo is archived ---
+          is_archived=$(gh api "/repos/${current_repo}" --jq '.archived')
+          if [ "$is_archived" = "true" ]; then
+            echo "::warning::${current_repo} is archived, skipping"
+            exit 0
+          fi
+
+          # --- Get default branch ---
+          default_branch=$(gh api "/repos/${current_repo}" --jq '.default_branch')
+
+          # --- Read local .wiz content ---
+          local_content=$(base64 < "$WIZ_SOURCE")
+
+          # --- No-op check: compare with existing file in target repo ---
+          remote_sha=""
+          remote_content=""
+          existing=$(gh api "/repos/${current_repo}/contents/${WIZ_TARGET_PATH}?ref=${default_branch}" 2>/dev/null || echo "")
+          if [ -n "$existing" ] && echo "$existing" | jq -e '.sha' > /dev/null 2>&1; then
+            remote_sha=$(echo "$existing" | jq -r '.sha')
+            remote_content=$(echo "$existing" | jq -r '.content' | tr -d '\n')
+          fi
+
+          if [ -n "$remote_content" ] && [ "$local_content" = "$remote_content" ]; then
+            echo "::notice::${current_repo} .wiz is already up to date, skipping"
+            exit 0
+          fi
+
+          # --- Close existing sync-hub PR and delete branch ---
+          existing_prs=$(gh api "/repos/${current_repo}/pulls?head=${owner}:${BRANCH_NAME}&state=open" 2>/dev/null || echo "[]")
+          pr_count=$(echo "$existing_prs" | jq 'length')
+          if [ "$pr_count" -gt 0 ]; then
+            echo "$existing_prs" | jq -r '.[].number' | while read -r pr_num; do
+              echo "Closing stale PR #${pr_num} in ${current_repo}"
+              gh api -X PATCH "/repos/${current_repo}/pulls/${pr_num}" \
+                -f state=closed \
+                -f body="Superseded by sync-hub commit ${COMMIT_SHA}" > /dev/null
+            done
+          fi
+
+          # Delete the branch if it exists
+          gh api -X DELETE "/repos/${current_repo}/git/refs/heads/${BRANCH_NAME}" 2>/dev/null || true
+
+          # --- Create branch from default branch HEAD ---
+          base_sha=$(gh api "/repos/${current_repo}/git/ref/heads/${default_branch}" --jq '.object.sha')
+
+          gh api -X POST "/repos/${current_repo}/git/refs" \
+            -f "ref=refs/heads/${BRANCH_NAME}" \
+            -f "sha=${base_sha}" > /dev/null
+
+          # --- Push .wiz file via Git Data API ---
+          blob_sha=$(gh api -X POST "/repos/${current_repo}/git/blobs" \
+            -f "content=$(cat "$WIZ_SOURCE")" \
+            -f "encoding=utf-8" \
+            --jq '.sha')
+
+          tree_sha=$(jq -n \
+            --arg base "$base_sha" \
+            --arg path "$WIZ_TARGET_PATH" \
+            --arg blob "$blob_sha" \
+            '{base_tree: $base, tree: [{path: $path, mode: "100644", type: "blob", sha: $blob}]}' \
+            | gh api -X POST "/repos/${current_repo}/git/trees" --input - --jq '.sha')
+
+          commit_sha=$(jq -n \
+            --arg msg "chore: update .wiz exception policy from sync-hub" \
+            --arg tree "$tree_sha" \
+            --arg parent "$base_sha" \
+            '{message: $msg, tree: $tree, parents: [$parent]}' \
+            | gh api -X POST "/repos/${current_repo}/git/commits" --input - --jq '.sha')
+
+          jq -n --arg sha "$commit_sha" '{sha: $sha, force: true}' \
+            | gh api -X PATCH "/repos/${current_repo}/git/refs/heads/${BRANCH_NAME}" --input - > /dev/null
+
+          # --- Open PR ---
+          pr_body="## Wiz Exception Policy Update
+
+          This PR was automatically generated by [sync-hub](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}).
+
+          **Source commit:** [\`${COMMIT_SHA:0:7}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${COMMIT_SHA})
+
+          Review the \`.wiz\` file changes and merge when ready."
+
+          pr_url=$(gh api -X POST "/repos/${current_repo}/pulls" \
+            -f "title=chore: update .wiz exception policy" \
+            -f "head=${BRANCH_NAME}" \
+            -f "base=${default_branch}" \
+            -f "body=${pr_body}" \
+            --jq '.html_url')
+
+          echo "::notice::Opened PR in ${current_repo}: ${pr_url}"
+
+  summary:
+    needs: [detect-changes, push-wiz]
+    if: always() && needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post summary
+        run: |
+          echo "## Sync-Hub Push Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Push exceptions workflow completed." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Trigger commit:** \`${GITHUB_SHA:0:7}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Matrix result:** \`${{ needs.push-wiz.result }}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/org/sync-hub/schemas/wiz.schema.json",
+  "title": "Wiz Exception Policy",
+  "description": "Schema for .wiz exception files used to suppress Wiz security findings.",
+  "type": "object",
+  "required": ["ignore"],
+  "additionalProperties": false,
+  "properties": {
+    "ignore": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "vulnerabilities": { "$ref": "#/$defs/categoryBlock" },
+        "iac": { "$ref": "#/$defs/categoryBlock" },
+        "sensitive_data": { "$ref": "#/$defs/categoryBlock" },
+        "sast": { "$ref": "#/$defs/categoryBlock" },
+        "software_management": { "$ref": "#/$defs/categoryBlock" }
+      }
+    }
+  },
+  "$defs": {
+    "categoryBlock": {
+      "description": "A set of rules keyed by finding ID (e.g. CVE-2024-1234, a UUID, or ALL).",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ruleBlock"
+      }
+    },
+    "ruleBlock": {
+      "description": "A set of file paths or globs that this rule applies to.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/fileEntry"
+      }
+    },
+    "fileEntry": {
+      "description": "Exception details for a specific file path or glob pattern.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": ["BY_DESIGN", "EXCEPTION", "FALSE_POSITIVE"],
+          "description": "Justification category for the exception."
+        },
+        "expires": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 datetime after which this exception is no longer valid."
+        }
+      }
+    }
+  }
+}

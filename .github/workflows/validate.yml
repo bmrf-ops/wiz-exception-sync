@@ -1,0 +1,73 @@
+name: Validate Wiz Exception Files
+
+on:
+  pull_request:
+    paths:
+      - "repositories/**/.wiz"
+      - "templates/**"
+      - "schemas/**"
+
+permissions:
+  contents: read
+
+env:
+  SCHEMA_PATH: schemas/wiz.schema.json
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: pip install --quiet yamllint check-jsonschema
+
+      - name: Find changed .wiz files
+        id: files
+        run: |
+          files=$(git diff --name-only --diff-filter=ACMR origin/${{ github.base_ref }}...HEAD \
+            -- 'repositories/**/.wiz' 'templates/.wiz' \
+            | grep -E '\.wiz$' || true)
+
+          if [ -z "$files" ]; then
+            echo "No .wiz or template files changed"
+            echo "has_files=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_files=true" >> "$GITHUB_OUTPUT"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$files" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "### Changed files:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "$files" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Lint YAML syntax
+        if: steps.files.outputs.has_files == 'true'
+        run: |
+          exit_code=0
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "Linting: $file"
+            if ! yamllint -d "{extends: relaxed, rules: {line-length: disable}}" "$file"; then
+              exit_code=1
+            fi
+          done <<< "${{ steps.files.outputs.files }}"
+          exit $exit_code
+
+      - name: Validate against schema
+        if: steps.files.outputs.has_files == 'true'
+        run: |
+          exit_code=0
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            echo "Validating: $file"
+            if ! check-jsonschema --schemafile "$SCHEMA_PATH" "$file"; then
+              exit_code=1
+            fi
+          done <<< "${{ steps.files.outputs.files }}"
+          exit $exit_code
