@@ -1,40 +1,4 @@
 ignore:
-  vulnerabilities:
-    CVE-2024-3817:
-      /app/go.mod:
-        reason: BY_DESIGN
-        expires: 2025-08-01T00:00:00Z
-
-    ALL:
-      /test/**/*: {}
-
-  iac:
-    2e35fea5-91d3-4a9b-b483-1b786827b170:
-      /docker/Dockerfile:
-        reason: BY_DESIGN
-    7ec67672-d8be-49c9-9064-196e35dcadcf:
-      /docker/Dockerfile:
-        expires: 2025-08-01T00:00:00Z
-
-  sensitive_data:
-    BUILTIN-123:
-      /data/test-data-sample.csv:
-        reason: FALSE_POSITIVE
-
-  sast:
-    WS-I013-PYTHON-00058:
-      /main.py:
-        reason: BY_DESIGN
-        expires: 2025-12-01T00:00:00Z
-
-    ALL:
-      /test/**/*: {}
-
   software_management:
-    wsscr-1:
-      /app/go.mod:
-        reason: BY_DESIGN
-        expires: 2025-08-01T00:00:00Z
-
     ALL:
       /test/**/*: {}
