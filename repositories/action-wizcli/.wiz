@@ -1,13 +1,4 @@
 ignore:
-  vulnerabilities:
-    CVE-2024-3817:
-      /app/go.mod:
-        reason: BY_DESIGN
-        expires: 2025-08-01T00:00:00Z
-
-    ALL:
-      /test/**/*: {}
-
   iac:
     2e35fea5-91d3-4a9b-b483-1b786827b170:
       /docker/Dockerfile:
