@@ -31,26 +31,22 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Discover repos accessible to the App
-        id: discover
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          repos_json=$(gh api --paginate /installation/repositories \
+          gh api --paginate /installation/repositories \
             --jq '.repositories[] | select(.archived == false and .fork == false) | {name: .name, id: .id, full_name: .full_name}' \
-            | jq -s '.')
+            | jq -s '.' > /tmp/repos.json
 
-          echo "repos<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$repos_json" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-          count=$(echo "$repos_json" | jq length)
+          count=$(jq length /tmp/repos.json)
           echo "Found $count active, non-fork repositories"
+          jq -r '.[].name' /tmp/repos.json
 
       - name: Scaffold new repo folders
         run: |
           now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          while read -r repo; do
+          jq -c '.[]' /tmp/repos.json | while IFS= read -r repo; do
             name=$(echo "$repo" | jq -r '.name')
             repo_dir="${REPOS_DIR}/${name}"
 
@@ -67,7 +63,7 @@ jobs:
               '{id: .id, full_name: .full_name, scaffolded_at: $ts}' \
               > "${repo_dir}/META.json"
 
-          done < <(echo '${{ steps.discover.outputs.repos }}' | jq -c '.[]')
+          done
 
       - name: Check for changes
         id: changes
